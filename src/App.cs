@@ -1,0 +1,555 @@
+using System;
+using System.Collections.Specialized;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using Microsoft.VisualBasic.FileIO;
+using Microsoft.Win32;
+using Forms = System.Windows.Forms;
+
+[assembly: AssemblyTitle("PicRope · 图绳")]
+[assembly: AssemblyProduct("PicRope")]
+[assembly: AssemblyDescription("图绳：把截图挂在屏幕上沿，随手复制、拖拽和保存。")]
+[assembly: AssemblyVersion("1.2.4.0")]
+[assembly: AssemblyFileVersion("1.2.4.0")]
+[assembly: AssemblyInformationalVersion("1.2.4")]
+
+namespace ScreenLine
+{
+    internal sealed class DesktopController : IDisposable
+    {
+        public readonly Gallery Gallery;
+        public readonly CapturePipeline Captures;
+        public readonly TextCollection Texts;
+        public readonly ShelfWindow Shelf;
+        readonly WindowsEvents events;
+        readonly Forms.NotifyIcon tray = new Forms.NotifyIcon();
+        LightNotice notice;
+        readonly CheckBox collect;
+        readonly CheckBox collectText;
+        readonly CheckBox autoHang;
+        internal readonly TrayPanel TrayMenu;
+        internal AppearanceWindow Appearance { get; private set; }
+        internal BasketWindow Basket { get; private set; }
+        internal TextWindow TextWindow { get; private set; }
+        internal CaptureWindow Capture { get; private set; }
+        internal ShortcutWindow ShortcutSettings { get; private set; }
+        readonly MenuItem captureMenu;
+        internal readonly List<ImageEditorWindow> Editors = new List<ImageEditorWindow>();
+        readonly AppUpdates updates = new AppUpdates();
+        readonly CancellationTokenSource updateLifetime = new CancellationTokenSource();
+        readonly DispatcherTimer updateTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(15) };
+        readonly MenuItem updateMenu;
+        readonly bool automaticUpdates;
+        UpdateRelease availableUpdate;
+        UpdateWindow updateWindow;
+        bool checkingUpdates, disposed;
+        uint textClipboardSequence;
+        int textClipboardVersion;
+        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+        public DesktopController(StateStore store, string screenshots, bool automaticUpdates = true)
+        {
+            this.automaticUpdates = automaticUpdates;
+            Gallery = new Gallery(store);
+            Texts = new TextCollection(store);
+            Captures = new CapturePipeline(Gallery, Application.Current.Dispatcher, screenshots);
+            Shelf = new ShelfWindow(Gallery, Act, EnableClipboard);
+            Shelf.BasketRequested += ShowBasket;
+            Shelf.TextRequested += ShowTexts;
+            Texts.Changed += Shelf.UpdateTexts;
+            events = new WindowsEvents(store.State.ToggleModifiers, store.State.ToggleKey);
+            events.RegisterCapture(store.State.CaptureModifiers, store.State.CaptureKey);
+            events.CaptureRequested += delegate { if (ShortcutSettings == null) ShowCapture(); };
+            events.ToggleRequested += delegate { if (ShortcutSettings == null) Shelf.Toggle(); };
+            events.ExitRequested += Exit;
+            events.ClipboardChanged += Captures.ClipboardChanged;
+            textClipboardSequence = WindowsNative.GetClipboardSequenceNumber();
+            events.ClipboardChanged += CollectClipboardText;
+            Captures.Arrived += Shelf.ShowNewCapture;
+            Captures.Failed += Notice;
+            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("PicRope.Icon"))
+                tray.Icon = new System.Drawing.Icon(stream, Forms.SystemInformation.SmallIconSize);
+            tray.Text = "PicRope · 图绳";
+            TrayMenu = new TrayPanel();
+            SyncScreens();
+            TrayMenu.Opened += delegate { SyncScreens(); };
+            TrayMenu.ScreenMenu.Opened += delegate { SyncScreens(); };
+            TrayMenu.OnAction(TrayMenu.VisibilityButton, delegate { Shelf.Toggle(); });
+            UpdateToggleLabel();
+            if (!events.ShortcutAvailable) Notice("显示/隐藏快捷键不可用，可点击托盘图标打开并在更多菜单中修改。");
+            TrayMenu.OnAction(TrayMenu.BasketButton, ShowBasket);
+            TrayMenu.OnAction(TrayMenu.TextButton, ShowTexts);
+            autoHang = TrayMenu.AutoHang;
+            TrayMenu.OnToggle(autoHang, Captures.AutoHang, delegate(bool value) { if (Captures.AutoHang != value) Captures.AutoHang = value; });
+            Gallery.Changed += SyncAutoHang;
+            collect = TrayMenu.Pictures;
+            TrayMenu.OnToggle(collect, Captures.CollectClipboard, delegate(bool value) { Captures.CollectClipboard = value; Shelf.Update(); });
+            collectText = TrayMenu.Text;
+            TrayMenu.OnToggle(collectText, Texts.CollectClipboard, delegate(bool value)
+            {
+                textClipboardVersion++;
+                textClipboardSequence = WindowsNative.GetClipboardSequenceNumber();
+                Texts.CollectClipboard = value;
+            });
+            TrayMenu.OnAction(TrayMenu.AppearanceButton, ShowAppearance);
+            var more = TrayMenu.MoreMenu;
+            MenuItem topHoverToggle = null;
+            topHoverToggle = more.AddAction("鼠标移至顶部时展开", "show", delegate
+            {
+                try { Shelf.SetRevealOnTopHover(topHoverToggle.IsChecked); }
+                catch (Exception error) { topHoverToggle.IsChecked = store.State.RevealOnTopHover; store.Log(error); Notice("顶部展开设置保存失败"); }
+            });
+            topHoverToggle.IsCheckable = true;
+            topHoverToggle.IsChecked = store.State.RevealOnTopHover;
+            MenuItem previewToggle = null;
+            previewToggle = more.AddAction("悬停预览", "picture", delegate
+            {
+                bool previous = store.State.HoverPreview;
+                store.State.HoverPreview = previewToggle.IsChecked;
+                try { store.Save(); Shelf.Preview.SetEnabled(store.State.HoverPreview); }
+                catch (Exception error) { store.State.HoverPreview = previous; previewToggle.IsChecked = previous; store.Log(error); Notice("预览设置保存失败"); }
+            });
+            previewToggle.IsCheckable = true;
+            previewToggle.IsChecked = store.State.HoverPreview;
+            captureMenu = more.AddAction("区域截图", "capture", ShowCapture);
+            UpdateCaptureLabel();
+            more.AddAction("截图快捷键…", "shortcut", delegate { ShowShortcutSettings(false); });
+            more.AddAction("显示/隐藏快捷键…", "shortcut", delegate { ShowShortcutSettings(true); });
+            more.Separator();
+            more.AddAction("添加图片…", "add", async delegate
+            {
+                var picker = new OpenFileDialog { Title = "添加图片", Filter = "图片|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff", Multiselect = true };
+                if (picker.ShowDialog() != true) return;
+                foreach (string file in picker.FileNames)
+                    if (!await Captures.Import(file, null, true)) Notice("无法读取图片：" + Path.GetFileName(file));
+            });
+            more.AddAction("打开收集文件夹", "folder", delegate
+            {
+                try { WindowsShell.OpenInbox(store); }
+                catch (Exception error) { store.Log(error); Notice("无法打开收集文件夹：" + error.Message); }
+            });
+            more.AddAction("全部取下（保留文件）", "clear", delegate { Gallery.Clear(); });
+            more.Separator();
+            MenuItem startup = null;
+            startup = more.AddAction("开机启动", "startup", delegate
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
+                {
+                    if (startup.IsChecked) key.SetValue("PicRope", Quote(Assembly.GetEntryAssembly().Location));
+                    else key.DeleteValue("PicRope", false);
+                }
+            });
+            startup.IsCheckable = true;
+            using (var key = Registry.CurrentUser.OpenSubKey(RunKey)) startup.IsChecked = key != null && key.GetValue("PicRope") != null;
+            updateMenu = more.AddAction("检查更新…", "save", async delegate { await CheckForUpdates(true); });
+            updateMenu.InputGestureText = "v" + AppUpdates.CurrentVersion;
+            updateTimer.Tick += async delegate { updateTimer.Interval = TimeSpan.FromHours(12); await CheckForUpdates(false); };
+            tray.BalloonTipClicked += delegate { ShowUpdate(); };
+            TrayMenu.OnAction(TrayMenu.ExitButton, Exit);
+            tray.MouseUp += delegate(object sender, Forms.MouseEventArgs args) { if (args.Button == Forms.MouseButtons.Right) ShowTrayMenu(); };
+            tray.MouseClick += delegate(object sender, Forms.MouseEventArgs args) { if (args.Button == Forms.MouseButtons.Left) Shelf.Toggle(); };
+            tray.Visible = true;
+        }
+
+        async void Exit()
+        {
+            foreach (var editor in Editors.ToArray()) if (!await editor.ConfirmClose()) return;
+            Application.Current.Shutdown();
+        }
+
+        public async Task Start()
+        {
+            Shelf.Show();
+            Shelf.Reveal(true, false, 4);
+            await Captures.Start();
+            if (automaticUpdates) updateTimer.Start();
+        }
+
+        void UpdateCaptureLabel()
+        {
+            captureMenu.InputGestureText = events.CaptureShortcutAvailable ? ShortcutWindow.Label(Gallery.Store.State.CaptureModifiers, Gallery.Store.State.CaptureKey) : "快捷键被占用";
+        }
+
+        void UpdateToggleLabel()
+        {
+            TrayMenu.Shortcut.Text = events.ShortcutAvailable ? ShortcutWindow.Label(Gallery.Store.State.ToggleModifiers, Gallery.Store.State.ToggleKey) : "快捷键不可用";
+        }
+
+        void ShowShortcutSettings(bool toggle)
+        {
+            if (ShortcutSettings != null) { ShortcutSettings.Activate(); return; }
+            var state = Gallery.Store.State;
+            ShortcutSettings = new ShortcutWindow(toggle ? "显示/隐藏快捷键" : "截图快捷键",
+                toggle ? state.ToggleModifiers : state.CaptureModifiers, toggle ? state.ToggleKey : state.CaptureKey,
+                3, (uint)(toggle ? 'T' : 'S'), delegate(uint modifiers, uint key)
+                {
+                    return SetShortcut(toggle, modifiers, key) ? null : shortcutError;
+                });
+            ShortcutSettings.Closed += delegate { ShortcutSettings = null; }; ShortcutSettings.Show();
+        }
+
+        string shortcutError;
+        internal bool SetCaptureShortcut(uint modifiers, uint key) { return SetShortcut(false, modifiers, key); }
+        internal bool SetToggleShortcut(uint modifiers, uint key) { return SetShortcut(true, modifiers, key); }
+
+        bool SetShortcut(bool toggle, uint modifiers, uint key)
+        {
+            shortcutError = "组合键已被占用或系统不支持，请换一组。";
+            if (!ShortcutRules.IsValid(modifiers, key)) { shortcutError = "请使用 Ctrl、Alt、Shift 或 Win 搭配有效按键。"; return false; }
+            var state = Gallery.Store.State;
+            if (modifiers == (toggle ? state.CaptureModifiers : state.ToggleModifiers) && key == (toggle ? state.CaptureKey : state.ToggleKey))
+            { shortcutError = "截图和显示/隐藏不能使用同一组合键。"; return false; }
+            uint previousModifiers = toggle ? state.ToggleModifiers : state.CaptureModifiers;
+            uint previousKey = toggle ? state.ToggleKey : state.CaptureKey;
+            Action persist = delegate
+            {
+                if (toggle) { state.ToggleModifiers = modifiers; state.ToggleKey = key; }
+                else { state.CaptureModifiers = modifiers; state.CaptureKey = key; }
+                try { Gallery.Store.Save(); }
+                catch
+                {
+                    if (toggle) { state.ToggleModifiers = previousModifiers; state.ToggleKey = previousKey; }
+                    else { state.CaptureModifiers = previousModifiers; state.CaptureKey = previousKey; }
+                    throw;
+                }
+            };
+            try
+            {
+                bool saved = toggle ? events.RegisterToggle(modifiers, key, persist) : events.RegisterCapture(modifiers, key, persist);
+                if (!saved) return false;
+            }
+            catch (Exception error)
+            {
+                shortcutError = "无法保存快捷键，原快捷键已保留，请重试。";
+                try { Gallery.Store.Log(error); } catch { }
+                return false;
+            }
+            UpdateCaptureLabel(); UpdateToggleLabel(); return true;
+        }
+
+        internal async void ShowCapture()
+        {
+            if (disposed || Shelf.Capturing) return;
+            Shelf.Capturing = true;
+            var display = WindowsNative.ScreenAtPointer();
+            bool revealed = Shelf.Revealed;
+            try
+            {
+                TrayMenu.Close(); if (Basket != null) Basket.Close(); if (TextWindow != null) TextWindow.Close();
+                if (Appearance != null) Appearance.Close(); if (ShortcutSettings != null) ShortcutSettings.Close();
+                Shelf.Reveal(false, false, 0); await Task.Delay(260);
+                if (disposed) return;
+                var capture = new CaptureWindow(display); Capture = capture;
+                var result = await capture.PickAsync(); Capture = null;
+                if (disposed) return;
+                if (result != null) await Captures.AcceptCapture(result,
+                    new Point(display.Bounds.Left + capture.Selection.Right, display.Bounds.Top + capture.Selection.Bottom));
+                else if (revealed) Shelf.Reveal(true, false, 2);
+            }
+            catch (Exception error) { if (!disposed) { Gallery.Store.Log(error); Notice("截图未完成，请重试。"); } }
+            finally { if (Capture != null) Capture.Close(); Capture = null; Shelf.Capturing = false; }
+        }
+
+        async Task CheckForUpdates(bool manual)
+        {
+            if (disposed || checkingUpdates) return;
+            if (manual && availableUpdate != null) { ShowUpdate(); return; }
+            checkingUpdates = true; updateMenu.IsEnabled = false; updateMenu.Header = "正在检查更新…";
+            try
+            {
+                availableUpdate = await updates.CheckAsync(updateLifetime.Token);
+                if (disposed) return;
+                if (availableUpdate == null) { if (manual) Notice("当前已是最新版 " + AppUpdates.CurrentVersion + "。"); }
+                else if (manual) ShowUpdate();
+                else if (Gallery.Store.State.LastUpdateNotification != availableUpdate.Version)
+                {
+                    tray.ShowBalloonTip(10000, "图绳有新版本 " + availableUpdate.Version, "点击查看更新并下载安装。", Forms.ToolTipIcon.Info);
+                    Gallery.Store.State.LastUpdateNotification = availableUpdate.Version; Gallery.Store.Save();
+                }
+            }
+            catch (Exception error)
+            {
+                if (!disposed && manual) Notice("暂时无法检查更新，请检查网络后重试。" + (error is System.IO.InvalidDataException ? "\n" + error.Message : ""));
+            }
+            finally
+            {
+                checkingUpdates = false; updateMenu.IsEnabled = true;
+                updateMenu.Header = availableUpdate == null ? "检查更新…" : "更新到 " + availableUpdate.Version + "…";
+            }
+        }
+
+        void ShowUpdate()
+        {
+            if (disposed || availableUpdate == null) return;
+            if (updateWindow != null) { updateWindow.Activate(); return; }
+            updateWindow = new UpdateWindow(availableUpdate, updates, async delegate(string work)
+            {
+                foreach (var editor in Editors.ToArray()) if (!await editor.ConfirmClose()) return false;
+                AppUpdates.Install(work);
+                Application.Current.Shutdown();
+                return true;
+            });
+            updateWindow.Closed += delegate { updateWindow = null; };
+            updateWindow.Show();
+        }
+
+        void EnableClipboard()
+        {
+            Captures.CollectClipboard = true;
+            collect.IsChecked = true;
+        }
+
+        void SyncAutoHang() { autoHang.IsChecked = Captures.AutoHang; }
+
+        void SyncScreens()
+        {
+            TrayMenu.SetScreens(WindowsNative.Screens, Gallery.Store.State.DisplayDevice, SelectScreen);
+        }
+
+        void SelectScreen(string device)
+        {
+            TrayMenu.Close();
+            try { Shelf.SetDisplay(device); }
+            catch (Exception error) { Gallery.Store.Log(error); Notice("无法保存屏幕设置：" + error.Message); }
+            SyncScreens();
+        }
+
+        async void CollectClipboardText()
+        {
+            uint sequence = WindowsNative.GetClipboardSequenceNumber();
+            if (disposed || !Texts.CollectClipboard || sequence == textClipboardSequence) return;
+            textClipboardSequence = sequence;
+            int version = textClipboardVersion;
+            try
+            {
+                string content = await WindowsClipboard.ReadText(sequence);
+                if (disposed || !Texts.CollectClipboard || version != textClipboardVersion || sequence != WindowsNative.GetClipboardSequenceNumber()) return;
+                Texts.Add(content);
+            }
+            catch (Exception error) { if (!disposed) Gallery.Store.Log(error); }
+        }
+
+        internal void ShowBasket()
+        {
+            if (Basket != null) { Basket.Activate(); return; }
+            Gallery.Prune();
+            Basket = new BasketWindow(Gallery, delegate(bool value) { Captures.AutoHang = value; }, Captures.Hang, Act);
+            Basket.Owner = Shelf;
+            Shelf.ChoosingBasket = true;
+            Shelf.Reveal(true, false, 0);
+            Basket.Closed += delegate { Basket = null; Shelf.ChoosingBasket = false; };
+            Basket.Show();
+        }
+
+        internal void ShowTexts()
+        {
+            if (TextWindow != null) { TextWindow.Close(); return; }
+            Shelf.Reveal(true, false, 0);
+            Shelf.ChoosingTexts = true;
+            TextWindow = new TextWindow(Texts, Shelf);
+            TextWindow.Closed += delegate { TextWindow = null; Shelf.ChoosingTexts = false; };
+            TextWindow.Show();
+        }
+
+        void ShowAppearance()
+        {
+            if (Appearance != null) { Appearance.Activate(); return; }
+            Appearance = new AppearanceWindow(Shelf.Appearance, Gallery, delegate(LineTheme theme)
+            {
+                Gallery.Store.State.Theme = theme.Id;
+                Gallery.Store.Save();
+                Shelf.ApplyTheme(theme);
+                Shelf.Reveal(true, false, 3);
+            });
+            Appearance.Owner = Shelf;
+            Shelf.ChoosingAppearance = true;
+            Shelf.Reveal(true, false, 0);
+            Appearance.Closed += delegate { Appearance = null; Shelf.ChoosingAppearance = false; };
+            Appearance.Show();
+        }
+
+        internal void ShowTrayMenu()
+        {
+            WindowsNative.SetForegroundWindow(Shelf.Handle);
+            var cursor = WindowsNative.Cursor();
+            var point = Shelf.PointFromScreen(new Point(cursor.X, cursor.Y));
+            TrayMenu.PlacementTarget = Shelf;
+            TrayMenu.Placement = PlacementMode.RelativePoint;
+            TrayMenu.HorizontalOffset = point.X - 16;
+            TrayMenu.VerticalOffset = point.Y - 16;
+            TrayMenu.IsOpen = true;
+        }
+
+        void Notice(string message)
+        {
+            if (notice != null) notice.Close();
+            notice = new LightNotice(message);
+            var current = notice;
+            current.Closed += delegate { if (notice == current) notice = null; };
+            notice.Show();
+        }
+
+        static string Quote(string path) { return "\"" + path + "\""; }
+
+        public async void Act(ShotAction action, CaptureItem item)
+        {
+            try
+            {
+                if (!File.Exists(item.Path)) { Gallery.Prune(); return; }
+                switch (action)
+                {
+                    case ShotAction.RemoveLeft:
+                    case ShotAction.RemoveRight:
+                    case ShotAction.RemoveOthers:
+                    case ShotAction.RemoveAll:
+                        var hanging = Shelf.HangingItems();
+                        int index = Array.IndexOf(hanging, item);
+                        if (index < 0) break;
+                        var targets = hanging.Where((image, position) => action == ShotAction.RemoveAll
+                            || action == ShotAction.RemoveLeft && position < index
+                            || action == ShotAction.RemoveRight && position > index
+                            || action == ShotAction.RemoveOthers && position != index).ToArray();
+                        Gallery.RemoveMany(targets);
+                        break;
+                    case ShotAction.Copy:
+                        var payload = new DataObject();
+                        byte[] png;
+                        using (var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        {
+                            var image = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad).Frames[0];
+                            payload.SetImage(image);
+                            png = ImageContent.EncodeClipboard(image);
+                        }
+                        payload.SetData("PNG", new MemoryStream(png));
+                        payload.SetFileDropList(new StringCollection { item.Path });
+                        payload.SetData(ClipboardRules.OwnFormat, "1");
+                        await WindowsClipboard.Write(payload);
+                        Shelf.ShowCopied(item.Path);
+                        break;
+                    case ShotAction.Open:
+                        Process.Start(new ProcessStartInfo(item.Path) { UseShellExecute = true });
+                        Shelf.FollowImageViewer(item.Path);
+                        break;
+                    case ShotAction.Edit:
+                        var existing = Editors.Find(editor => FileRules.SameFile(editor.ImagePath, item.Path));
+                        if (existing != null)
+                        {
+                            existing.Present();
+                            break;
+                        }
+                        if (!FileRules.IsInside(item.Path, Gallery.Store.Inbox))
+                        {
+                            string copy = await Task.Run(() => Captures.CopyToInbox(item.Path));
+                            try
+                            {
+                                var replacement = Gallery.Replace(item, copy);
+                                if (replacement == null) { File.Delete(copy); break; }
+                                item = replacement;
+                            }
+                            catch { File.Delete(copy); throw; }
+                        }
+                        var window = new ImageEditorWindow(item.Path, Gallery.Store, RefreshEditedImage, Captures.IgnoreCurrentClipboard);
+                        Editors.Add(window);
+                        window.Closed += delegate
+                        {
+                            Editors.Remove(window);
+                            if (!window.ReturnBounds.IsEmpty) Shelf.ShowEditedImage(window.ImagePath, window.ReturnBounds, window.ReturnPicture);
+                        };
+                        Shelf.Reveal(false, false, 0);
+                        window.Present();
+                        break;
+                    case ShotAction.Save:
+                        var dialog = new SaveFileDialog { Title = "保存副本", FileName = Path.GetFileName(item.Path), Filter = "图片|*" + Path.GetExtension(item.Path), OverwritePrompt = true };
+                        if (dialog.ShowDialog() == true && !FileRules.SameFile(item.Path, dialog.FileName)) File.Copy(item.Path, dialog.FileName, true);
+                        break;
+                    case ShotAction.Locate:
+                        Process.Start("explorer.exe", "/select," + Quote(item.Path));
+                        break;
+                    case ShotAction.Remove:
+                        Shelf.ShowCollect(item);
+                        Gallery.Remove(item);
+                        break;
+                    case ShotAction.Trash:
+                        if (FileRules.IsInside(item.Path, Gallery.Store.Inbox))
+                        {
+                            FileSystem.DeleteFile(item.Path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+                            Shelf.ShowDiscard(item);
+                            Gallery.Prune();
+                        }
+                        else { Shelf.ShowDiscard(item); Gallery.Forget(item); }
+                        break;
+                }
+            }
+            catch (Exception error) { Gallery.Store.Log(error); Notice("操作未完成：" + error.Message); }
+        }
+
+        public void Dispose()
+        {
+            disposed = true; updateTimer.Stop(); updateLifetime.Cancel();
+            if (Capture != null) Capture.Close();
+            if (ShortcutSettings != null) ShortcutSettings.Close();
+            if (updateWindow != null) updateWindow.Close();
+            updates.Dispose();
+            if (Basket != null) Basket.Close();
+            if (TextWindow != null) TextWindow.Close();
+            if (Appearance != null) Appearance.Close();
+            if (notice != null) notice.Close();
+            foreach (var editor in Editors.ToArray()) editor.CloseWithoutPrompt();
+            TrayMenu.Close();
+            Gallery.Changed -= SyncAutoHang;
+            Texts.Changed -= Shelf.UpdateTexts;
+            Captures.Dispose();
+            events.Dispose();
+            tray.Visible = false;
+            var icon = tray.Icon;
+            tray.Dispose();
+            icon.Dispose();
+            Shelf.Close();
+        }
+
+        async Task RefreshEditedImage(string path)
+        {
+            ImageContent image = await Task.Run(() => ImageContent.Read(path));
+            var item = Gallery.Items.Find(candidate => FileRules.SameFile(candidate.Path, path));
+            if (item == null) Gallery.Add(path, image);
+            else
+            {
+                item.Image = image;
+                item.Written = File.GetLastWriteTimeUtc(path);
+                Gallery.Notify();
+            }
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        public static void Main(string[] arguments)
+        {
+            if (Array.IndexOf(arguments, "--quit") >= 0) { WindowsNative.RequestExit(); return; }
+            bool first;
+            using (var instance = new Mutex(true, @"Local\TangHao.ScreenLine.Windows", out first))
+            {
+                if (!first) { WindowsNative.ShowExisting(); return; }
+                var store = new StateStore(StateStore.DefaultRoot);
+                var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+                LightTheme.Install(app);
+                DesktopController controller = null;
+                app.DispatcherUnhandledException += delegate(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs args) { store.Log(args.Exception); args.Handled = true; };
+                app.Startup += async delegate { controller = new DesktopController(store, WindowsNative.ScreenshotFolder()); await controller.Start(); };
+                app.Exit += delegate { if (controller != null) controller.Dispose(); };
+                app.Run();
+            }
+        }
+    }
+}
