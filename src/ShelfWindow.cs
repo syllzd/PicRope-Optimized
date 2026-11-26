@@ -339,7 +339,7 @@ namespace ScreenLine
                 ShotCard card;
                 if (!cards.TryGetValue(item.Path, out card))
                 {
-                    card = new ShotCard(item, act, gallery, HangingItems);
+                    card = new ShotCard(item, act, gallery, HangingItems, WindowsNative.MonitorScale(Display));
                     var hovered = card;
                     card.Surface.MouseEnter += delegate { Preview.Enter(hovered); };
                     card.Surface.MouseLeave += delegate { Preview.Leave(hovered); };
@@ -890,7 +890,7 @@ namespace ScreenLine
         public int ColorIndex { get; private set; }
         internal double MountX { get { return xMotion.Target; } }
 
-        public ShotCard(CaptureItem item, Action<ShotAction, CaptureItem> act, Gallery gallery, Func<CaptureItem[]> hangingItems)
+        public ShotCard(CaptureItem item, Action<ShotAction, CaptureItem> act, Gallery gallery, Func<CaptureItem[]> hangingItems, double cacheScale)
         {
             Item = item;
             Appearance = LineTheme.All[0];
@@ -898,7 +898,9 @@ namespace ScreenLine
             Width = 164;
             Height = 178;
             RenderTransform = tilt;
-            CacheMode = new BitmapCache();
+            // 缓存按物理像素生成：1× 缓存会在高 DPI 屏（如 175%）上先压后放导致图片发虚。
+            // 与 PinnedImageWindow / ShotFlight 一致，缓存倍率取显示器实际缩放。
+            CacheMode = new BitmapCache(cacheScale);
             Tilt = (item.Path.GetHashCode() & 7) * 0.7 - 2.45;
             Opacity = 0;
             Surface.RenderTransform = photoScale;

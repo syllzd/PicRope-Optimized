@@ -80,6 +80,10 @@ namespace ScreenLine.Tests
             Check(await controller.Captures.Import(original, null, false), "可以添加本地图片");
             var imported = controller.Gallery.Items.Single();
             Check(FileRules.IsInside(imported.Path, store.Inbox) && !FileRules.SameFile(original, imported.Path), "添加本地图片时收集副本");
+            // 绳上卡片缓存需按显示器 DPI 倍率生成（默认 1× 会在高 DPI 屏上先压后放导致发虚）。
+            var probeCard = new ShotCard(imported, delegate { }, controller.Gallery, delegate { return new CaptureItem[0]; }, 1.75);
+            var probeCache = probeCard.CacheMode as BitmapCache;
+            Check(probeCache != null && Math.Abs(probeCache.RenderAtScale - 1.75) < 0.001, "绳上卡片缓存倍率按显示器 DPI 设置");
             controller.Act(ShotAction.Trash, imported);
             Check(File.Exists(original) && !File.Exists(imported.Path), "删除导入图片只删除副本");
             controller.Gallery.Add(original, ImageContent.Read(original));
