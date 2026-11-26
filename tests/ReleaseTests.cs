@@ -70,6 +70,15 @@ namespace ScreenLine.Tests
 
         static async Task Run()
         {
+            // 顶边悬停：判定阈值与各类抑制条件（纯逻辑，不依赖鼠标命中）。
+            var t0 = DateTime.UtcNow;
+            Check(ShelfWindow.TopHoverDelayMs == 150, "顶边悬停判定缩短到 150ms");
+            Check(!ShelfWindow.EdgeHoverReady(t0.AddMilliseconds(149), t0, false, false, false), "顶边停留不足 150ms 不展开");
+            Check(ShelfWindow.EdgeHoverReady(t0.AddMilliseconds(150), t0, false, false, false), "顶边停留满 150ms 触发展开");
+            Check(!ShelfWindow.EdgeHoverReady(t0.AddSeconds(2), t0, true, false, false), "按住鼠标时不展开");
+            Check(!ShelfWindow.EdgeHoverReady(t0.AddSeconds(2), t0, false, true, false), "拖拽抑制期间不展开");
+            Check(!ShelfWindow.EdgeHoverReady(t0.AddSeconds(2), t0, false, false, true), "标题栏按钮抑制期间不展开");
+
             root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "test-data", "release-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
             var store = new StateStore(Path.Combine(root, "profile"));
@@ -158,7 +167,14 @@ namespace ScreenLine.Tests
             backdrop.WindowState = WindowState.Maximized; backdrop.Activate();
             SetCursorPos(area.Right - (int)Math.Round(80 * scale), area.Top + (int)Math.Round(160 * scale));
             await Task.Delay(450);
-            Check(controller.Shelf.Revealed, "移出控制按钮区域后恢复展开，仍能接近篮子");
+            Check(!controller.Shelf.Revealed, "离开控制按钮但仍停留在顶部区域时不恢复展开（避免关窗误触）");
+            // 必须移出顶部区域再回来，才重新开始顶边悬停判定。
+            SetCursorPos(area.Right - (int)Math.Round(80 * scale), area.Top + (int)Math.Round(300 * scale));
+            await Task.Delay(120);
+            SetCursorPos(area.Left + (int)Math.Round(80 * scale), area.Top + 1);
+            for (int i = 0; i < 20 && !controller.Shelf.Revealed; i++) await Task.Delay(50);
+            Check(controller.Shelf.Revealed, "离开顶部区域再回来后恢复顶边悬停展开");
+            for (int i = 0; i < 20 && controller.Shelf.Animating; i++) await Task.Delay(50);
             Point basketPoint = controller.Shelf.BasketButton.PointToScreen(new Point(controller.Shelf.BasketButton.ActualWidth / 2, 90));
             SetCursorPos((int)basketPoint.X, (int)basketPoint.Y); await Task.Delay(160);
             mouse_event(2, 0, 0, 0, UIntPtr.Zero); mouse_event(4, 0, 0, 0, UIntPtr.Zero);

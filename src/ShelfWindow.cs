@@ -74,6 +74,17 @@ namespace ScreenLine
         double lastScrollOffset;
         bool rendering;
         bool pinned, previousDown, suppressEdge, trackingScrollHover, avoidingCaption, switchingDisplay, displayMoveQueued;
+        // 标题栏按钮（含关闭）触发的抑制：一直保持到鼠标离开顶部区域再回来，避免关窗后立刻误唤挂绳。
+        bool captionHold;
+        internal const int TopHoverDelayMs = 150;
+
+        // 顶边悬停判定：按下、拖拽抑制、标题栏按钮抑制期间都不展开；必须在顶边连续停留足够时间。
+        internal static bool EdgeHoverReady(DateTime now, DateTime edgeSince, bool down, bool suppressEdge, bool captionHold)
+        {
+            return !down && !suppressEdge && !captionHold
+                && edgeSince != DateTime.MaxValue
+                && now - edgeSince >= TimeSpan.FromMilliseconds(TopHoverDelayMs);
+        }
         int displaySwitchVersion;
         string viewingName;
         IntPtr viewingWindow;
@@ -339,7 +350,9 @@ namespace ScreenLine
                 ShotCard card;
                 if (!cards.TryGetValue(item.Path, out card))
                 {
-                    card = new ShotCard(item, act, gallery, HangingItems, WindowsNative.MonitorScale(Display));
+                    // Display 在首次 PositionOnDisplay 前可能尚未赋值，回退到当前选择的显示器。
+                    var cardScreen = Display ?? SelectedDisplay();
+                    card = new ShotCard(item, act, gallery, HangingItems, cardScreen == null ? 1 : WindowsNative.MonitorScale(cardScreen));
                     var hovered = card;
                     card.Surface.MouseEnter += delegate { Preview.Enter(hovered); };
                     card.Surface.MouseLeave += delegate { Preview.Leave(hovered); };
@@ -788,20 +801,25 @@ namespace ScreenLine
                 && WindowsNative.OverCaptionButtons(screen, cursor, Handle))
             {
                 edgeSince = DateTime.MaxValue; previousDown = down;
+                // 标题栏按钮（关闭/最小化等）落点：抑制挂绳，直到鼠标离开顶部区域再回来。
+                captionHold = true;
                 if (Revealed) { avoidingCaption = true; Reveal(false, false, 0); }
                 return;
             }
-            if (avoidingCaption && !down && hideTime >= 0.22)
+            // 曾因标题栏按钮收起：只有鼠标离开顶部区域后才解除抑制并恢复常规顶边悬停。
+            var holdScreen = Display ?? screen;
+            if (captionHold && !down && hideTime >= 0.22 && holdScreen != null
+                && !(cursor.X >= holdScreen.Bounds.Left && cursor.X < holdScreen.Bounds.Right
+                    && cursor.Y >= holdScreen.Bounds.Top && cursor.Y < holdScreen.WorkingArea.Top + 220 * WindowsNative.MonitorScale(holdScreen)))
             {
+                captionHold = false;
                 avoidingCaption = false;
-                if (cursor.X >= Display.Bounds.Left && cursor.X < Display.Bounds.Right
-                    && cursor.Y >= Display.WorkingArea.Top && cursor.Y < Display.WorkingArea.Top + 220 * WindowsNative.MonitorScale(Display))
-                    Reveal(true, false, 0);
             }
             if (gallery.Store.State.RevealOnTopHover && nearTop && !down && !suppressEdge && !WindowsNative.FullScreen(screen, Handle))
             {
                 if (edgeSince == DateTime.MaxValue) edgeSince = now;
-                if (now - edgeSince >= TimeSpan.FromMilliseconds(320) && (!Revealed || screen.DeviceName != Display.DeviceName))
+                if (EdgeHoverReady(now, edgeSince, down, suppressEdge, captionHold)
+                    && (!Revealed || screen.DeviceName != Display.DeviceName))
                 {
                     if (Revealed && screen.DeviceName != Display.DeviceName)
                     {
