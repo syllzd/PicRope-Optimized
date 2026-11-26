@@ -179,17 +179,48 @@ namespace ScreenLine.Tests
                 var restored = new StateStore(store.Root);
                 Check(restored.State.Images.Count == 0 && restored.State.Collection.Single() == file);
             });
-            Run("绳子达到上限后仍保留所有收集记录", delegate
+            Run("绳上默认保留最近 10 张，最远的自动淘汰并回调处置", delegate
             {
                 var gallery = new Gallery(new StateStore(Path.Combine(root, "basket-limit-profile")));
-                for (int i = 0; i < 52; i++)
+                var evicted = new System.Collections.Generic.List<string>();
+                gallery.OnEvicted = item => evicted.Add(item.Path);
+                Check(gallery.MaxHangingImages == 10 && HangingLimitRules.Default == 10);
+                for (int i = 0; i < 15; i++)
                 {
                     string file = WritePicture("收集_" + i + ".png", (byte)i);
                     gallery.Add(file, ImageContent.Read(file));
                 }
-                Check(gallery.Items.Count == 50 && gallery.Collected.Count == 52);
+                Check(gallery.Items.Count == 10);
+                Check(gallery.Collected.Count == 10);
+                Check(evicted.Count == 5);
+                for (int i = 0; i < 5; i++) Check(evicted[i].Contains("收集_" + i + ".png"));
+                Check(gallery.Items[0].Path.Contains("收集_5.png") && gallery.Items[9].Path.Contains("收集_14.png"));
                 gallery.Clear();
-                Check(gallery.Items.Count == 0 && gallery.Collected.Count == 52);
+                Check(gallery.Items.Count == 0);
+            });
+            Run("上限可调、范围钳制，调小后立即收敛", delegate
+            {
+                var store = new StateStore(Path.Combine(root, "limit-config-profile"));
+                var gallery = new Gallery(store);
+                for (int i = 0; i < 8; i++)
+                {
+                    string file = WritePicture("档位_" + i + ".png", (byte)(i + 20));
+                    gallery.Add(file, ImageContent.Read(file));
+                }
+                gallery.MaxHangingImages = 3;
+                Check(gallery.Items.Count == 3 && new StateStore(store.Root).State.MaxHangingImages == 3);
+                gallery.MaxHangingImages = 200;
+                Check(gallery.MaxHangingImages == HangingLimitRules.Max);
+                gallery.MaxHangingImages = -5;
+                Check(gallery.MaxHangingImages == HangingLimitRules.Min);
+            });
+            Run("旧配置缺少上限字段时按默认 10 处理", delegate
+            {
+                string profile = Path.Combine(root, "legacy-limit-profile");
+                Directory.CreateDirectory(profile);
+                File.WriteAllText(Path.Combine(profile, "state.json"), "{\"Images\":[],\"Collection\":[],\"AutoHang\":true}");
+                var store = new StateStore(profile);
+                Check(store.State.MaxHangingImages == 10);
             });
             Run("重新挂上已编辑的图片时使用最新内容", delegate
             {

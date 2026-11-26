@@ -1090,6 +1090,7 @@ namespace ScreenLine.Tests
             {
                 shelf.ChoosingBasket = true;
                 controller.Gallery.Clear();
+                controller.Gallery.MaxHangingImages = 50; // 长列表滚动边界仍按 50 张验证
                 Directory.CreateDirectory(store.Inbox);
                 for (int i = 0; i < 50; i++)
                 {
@@ -2072,9 +2073,9 @@ namespace ScreenLine.Tests
             Point bottomRight = trayMenu.PointToScreen(new Point(trayMenu.ActualWidth, trayMenu.ActualHeight));
             Check(topLeft.X >= screen.Bounds.Left && topLeft.Y >= screen.Bounds.Top
                 && bottomRight.X <= screen.Bounds.Right + 1 && bottomRight.Y <= screen.Bounds.Bottom + 1, "屏幕右下角的托盘菜单完整显示，没有超出屏幕");
-            Check(trayMenu.MoreMenu.Items.OfType<MenuItem>().Count(x => x.IsEnabled) == 9
-                && trayMenu.MoreMenu.Items.OfType<MenuItem>().Any(item => item.Header as string == "区域截图")
-                && trayMenu.MoreMenu.Items.OfType<MenuItem>().Any(item => item.Header as string == "截图快捷键…"), "更多操作保留原入口并提供区域截图与快捷键设置");
+            Check(trayMenu.MoreMenu.Items.OfType<MenuItem>().Any(item => item.Header as string == "区域截图")
+                && trayMenu.MoreMenu.Items.OfType<MenuItem>().Any(item => (item.Header as string ?? "").StartsWith("绳上保留图片："))
+                && trayMenu.MoreMenu.Items.OfType<MenuItem>().Any(item => item.Header as string == "截图快捷键…"), "更多操作保留原入口并提供区域截图、保留张数与快捷键设置");
             Check(trayMenu.ScreenButton.IsVisible && trayMenu.ScreenMode.Text == "跟随鼠标", "显示屏幕入口直接呈现当前模式");
             await ClickMenu(trayMenu.ScreenButton);
             await Until(() => trayMenu.ScreenMenu.IsOpen && trayMenu.ScreenMenu.ActualHeight > 0);

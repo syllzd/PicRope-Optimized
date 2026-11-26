@@ -27,11 +27,27 @@ namespace ScreenLine
         public uint CaptureKey { get; set; }
         public uint ToggleModifiers { get; set; }
         public uint ToggleKey { get; set; }
+        // 绳上保留的图片数；超出时从最远的一张起淘汰。合法范围由 HangingLimitRules 约束。
+        public int MaxHangingImages { get; set; }
         public List<string> Images { get; set; }
         public List<string> Collection { get; set; }
         public List<TextItem> Texts { get; set; }
 
-        public SavedState() { Images = new List<string>(); Collection = new List<string>(); Texts = new List<TextItem>(); Theme = "classic"; AutoHang = true; HoverPreview = true; RevealOnTopHover = true; CaptureModifiers = 3; CaptureKey = (uint)'S'; ToggleModifiers = 3; ToggleKey = (uint)'T'; }
+        public SavedState() { Images = new List<string>(); Collection = new List<string>(); Texts = new List<TextItem>(); Theme = "classic"; AutoHang = true; HoverPreview = true; RevealOnTopHover = true; CaptureModifiers = 3; CaptureKey = (uint)'S'; ToggleModifiers = 3; ToggleKey = (uint)'T'; MaxHangingImages = HangingLimitRules.Default; }
+    }
+
+    // 数量上限的单一口径：默认值、范围钳制与档位都在这里，UI 与数据层共用。
+    internal static class HangingLimitRules
+    {
+        public const int Default = 10;
+        public const int Min = 1;
+        public const int Max = 100;
+        public static readonly int[] Presets = { 5, 10, 20, 50, 100 };
+
+        public static int Clamp(int value)
+        {
+            return value < Min ? Min : value > Max ? Max : value;
+        }
     }
 
     internal static class ShortcutRules
@@ -65,6 +81,8 @@ namespace ScreenLine
                 if (State.Images == null) State.Images = new List<string>();
                 if (State.Collection == null) State.Collection = new List<string>();
                 if (State.Texts == null) State.Texts = new List<TextItem>();
+                // 升级前的 state.json 无此字段（反序列化为 0），按默认值处理并统一钳制到合法范围。
+                State.MaxHangingImages = State.MaxHangingImages <= 0 ? HangingLimitRules.Default : HangingLimitRules.Clamp(State.MaxHangingImages);
                 if (!ShortcutRules.IsValid(State.ToggleModifiers, State.ToggleKey)) { State.ToggleModifiers = 3; State.ToggleKey = (uint)'T'; }
             }
             catch (ArgumentException ex) { Log(ex); }
@@ -549,8 +567,25 @@ namespace ScreenLine
         public readonly List<CaptureItem> Collected = new List<CaptureItem>();
         public readonly StateStore Store;
         public event Action Changed;
+        // 超限淘汰的项交由上层处置（删到回收站 / 丢弃动画）；数据层只负责出队，避免 Core 依赖 UI。
+        public Action<CaptureItem> OnEvicted;
 
         public Gallery(StateStore store) { Store = store; }
+
+        // 绳上保留数量上限，写入即持久化；读取时钳制，兼容旧配置与外部改动。
+        public int MaxHangingImages
+        {
+            get { return HangingLimitRules.Clamp(Store.State.MaxHangingImages); }
+            set
+            {
+                int next = HangingLimitRules.Clamp(value);
+                if (Store.State.MaxHangingImages == next) return;
+                Store.State.MaxHangingImages = next;
+                EnforceLimit();
+                Save(); // 淘汰后再落盘，避免 state.json 残留已删除项的路径
+                Notify();
+            }
+        }
 
         public bool Contains(string path) { return Items.Any(i => FileRules.SameFile(i.Path, path)); }
 
@@ -572,9 +607,23 @@ namespace ScreenLine
             if (item == null) { item = new CaptureItem(path, image); Collected.Add(item); }
             else if (item.Image != image) { item.Image = image.ForFile(path); item.Written = File.GetLastWriteTimeUtc(path); }
             Items.Add(item);
-            if (Items.Count > 50) Items.RemoveAt(0);
+            EnforceLimit();
             Save();
             Notify();
+        }
+
+        // 超出上限时从最远（列表开头）逐张淘汰，直到只剩最近的 N 张。
+        // 淘汰项同时移出绳子与图片篮，再回调上层处置文件；上限调小也会立即收敛。
+        void EnforceLimit()
+        {
+            int limit = MaxHangingImages;
+            while (Items.Count > limit)
+            {
+                var evicted = Items[0];
+                Items.RemoveAt(0);
+                Collected.Remove(evicted);
+                if (OnEvicted != null) OnEvicted(evicted);
+            }
         }
 
         public void Remove(CaptureItem item)

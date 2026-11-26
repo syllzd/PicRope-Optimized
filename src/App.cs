@@ -67,6 +67,18 @@ namespace ScreenLine
             Shelf.BasketRequested += ShowBasket;
             Shelf.TextRequested += ShowTexts;
             Texts.Changed += Shelf.UpdateTexts;
+            // 超限淘汰：复用「删除」动作的安全规则——只删程序自己收进 Inbox 的截图，
+            // 用户从外部导入的图片仅移除图绳记录，绝不碰原文件。
+            Gallery.OnEvicted = delegate(CaptureItem evicted)
+            {
+                try
+                {
+                    Shelf.ShowDiscard(evicted);
+                    if (FileRules.IsInside(evicted.Path, Gallery.Store.Inbox))
+                        FileSystem.DeleteFile(evicted.Path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+                }
+                catch (Exception error) { store.Log(error); }
+            };
             events = new WindowsEvents(store.State.ToggleModifiers, store.State.ToggleKey);
             events.RegisterCapture(store.State.CaptureModifiers, store.State.CaptureKey);
             events.CaptureRequested += delegate { if (ShortcutSettings == null) ShowCapture(); };
@@ -121,6 +133,20 @@ namespace ScreenLine
             });
             previewToggle.IsCheckable = true;
             previewToggle.IsChecked = store.State.HoverPreview;
+            // 绳上保留张数：点击在预设档位间循环，切换后立即淘汰到新的上限。
+            MenuItem limitMenu = null;
+            limitMenu = more.AddAction("", "picture", delegate
+            {
+                int[] presets = HangingLimitRules.Presets;
+                int current = Gallery.MaxHangingImages;
+                int next = presets[0];
+                for (int i = 0; i < presets.Length; i++)
+                    if (presets[i] > current) { next = presets[i]; break; }
+                try { Gallery.MaxHangingImages = next; }
+                catch (Exception error) { store.Log(error); Notice("上限设置保存失败"); }
+                limitMenu.Header = "绳上保留图片：" + Gallery.MaxHangingImages + " 张（点击切换）";
+            });
+            limitMenu.Header = "绳上保留图片：" + Gallery.MaxHangingImages + " 张（点击切换）";
             captureMenu = more.AddAction("区域截图", "capture", ShowCapture);
             UpdateCaptureLabel();
             more.AddAction("截图快捷键…", "shortcut", delegate { ShowShortcutSettings(false); });

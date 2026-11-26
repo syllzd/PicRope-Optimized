@@ -358,6 +358,7 @@ namespace ScreenLine.Tests
             try
             {
                 await controller.Start();
+                controller.Gallery.MaxHangingImages = 50; // 本探针按多张挂图验证飞行帧
                 for (int i = 0; i < 49; i++)
                 {
                     string path = Picture(root, "existing-" + i, 320, 180);
@@ -414,7 +415,7 @@ namespace ScreenLine.Tests
                         }
                         Check(flight.CaptureRenderer != null && flight.CaptureRenderer.Failure == null, "真实截图使用优化绘制路径");
                         Check(flight.CaptureRenderer.Intervals.Length >= 20, "真实截图具有连续的飞行帧");
-                        Check(controller.Gallery.Items.Count == Math.Min(50, before + 1), "一次截图只新增一张挂图，并遵守挂图上限");
+                        Check(controller.Gallery.Items.Count == Math.Min(controller.Gallery.MaxHangingImages, before + 1), "一次截图只新增一张挂图，并遵守挂图上限");
                         await Task.Delay(300); await NativeReleased();
                         Check(!controller.Shelf.MotionWindows.Any() && !controller.Shelf.CardFor(controller.Gallery.Items.Last().Path).Flying, "截图完整飞行并落位");
                         controller.Shelf.Reveal(false, false, 0); await Task.Delay(400);
